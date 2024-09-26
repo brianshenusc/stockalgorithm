@@ -7,6 +7,7 @@ This project is an automated stock trading algorithm based on Mean Reversion and
 - [Setup](#setup)
 - [Features](#features)
 - [Usage](#usage)
+- [Future Improvements](#future-improvements)
 
 ## Prerequisites
 1. Have AWS account with admin access and connect it to terminal
@@ -14,7 +15,7 @@ This project is an automated stock trading algorithm based on Mean Reversion and
 3. Create DynamoDB table named stock_data
 
 ## Setup
-1. Replace Alpaca and AWS access keys with your own keys
+1. Replace Alpaca and AWS access keys with your own keys as well as the AWS region in the code (where you replace AWS access keys) 
 2. Navigate to correct folder and run the following while replacing anything with <>
 ```bash
 docker build -t stock-algorithm-image .
@@ -35,3 +36,10 @@ docker push <YOUR AWS USER ID>.dkr.ecr.<YOUR AWS REGION (us-east-1)>.amazonaws.c
 - Ensure the Lambda function is running as expected, either through EventBridge (automated) or manually triggering it in the AWS Console.
 - You can monitor logs in AWS CloudWatch to check the status and output of your trading algorithm.
 - Program costs ~$0.10 per month to run subjet to change based on how often it is run
+
+## Future Improvements
+- Use AWS Secrets Manager to hold the access keys (currently not done due to extra costs)
+- Improve features for the RandomForestClassifier Model
+- Performance (yfinance downloads are threaded but can be done faster for optimization)
+- Implement data analytics as more DynamoDB data is entered for further optimization
+- Adjust hyperparameters (moving average) for optimization
