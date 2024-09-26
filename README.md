@@ -10,9 +10,10 @@ This project is an automated stock trading algorithm based on Mean Reversion and
 - [Future Improvements](#future-improvements)
 
 ## Prerequisites
-1. Have AWS account with admin access and connect it to terminal
-2. Have Docker Desktop open
-3. Create DynamoDB table named stock_data
+1. Have Alpaca Markets Account
+2. Have AWS account with admin access and connect it to terminal
+3. Have Docker Desktop open
+4. Create DynamoDB table named stock_data
 
 ## Setup
 1. Replace Alpaca and AWS access keys with your own keys as well as the AWS region in the code (where you replace AWS access keys) 
