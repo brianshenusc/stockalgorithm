@@ -19,13 +19,14 @@ from sklearn.preprocessing import StandardScaler
 import time
 from decimal import Decimal
 import json
+import plotly.graph_objects as go
 
 # starts the algorithm through the lambda_helper
 def start_algorithm():
     # Connecting to Alpaca web API
     API_KEY = 'ALPACA API KEY'
-    SECRET_KEY = 'ALPACA API SECRET KEY'
-    BASE_URL = 'https://paper-api.alpaca.markets'  # or the live URL
+    SECRET_KEY = 'ALPACA SECRET API KEY'
+    BASE_URL = 'https://paper-api.alpaca.markets'  # for paper trading or optionally use the live URL for actual trading
     api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
 
     # creates a portfolio dataframe with the currently invested stocks and the buy date
@@ -58,12 +59,15 @@ def start_algorithm():
         ticker_data = ticker_data.dropna()
         stocks[ticker] = ticker_data
 
+    aws_access_key = 'AWS ACCESS KEY'
+    aws_secret_access_key = 'AWS SECRET ACCESS KEY'
+    region_name = 'AWS REGION'
 
     # connects to AWS DynamoDB
     session = boto3.Session(
-    aws_access_key_id='AWS ACCESS KEY',
-    aws_secret_access_key='AWS SECRET ACCESS KEY',
-    region_name='us-east-1'
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name=region_name
     )
     dynamodb = session.resource('dynamodb')
     table = dynamodb.Table('stock_data')
@@ -527,6 +531,251 @@ def start_algorithm():
     else:
         print("Finished Algorithm Without Errors And Did Not Buy Anything")
 
+
+    def generate_graph(aws_access_key_id, aws_secret_access_key, region_name):
+        """
+        Generates an interactive plotly graph of the portfolio ROI vs SPY % change to visualize portfolio
+        performance. Also displays the portfolio beta, sharpe ratio, and win rate as key metrics.
+
+        Parameters
+            aws_access_key_id (string): AWS Access Key.
+            aws_secret_access_key_id (string): AWS Secret Access Key.
+            region_name (string): AWS Region (us-east-1)
+
+        Returns:
+        None. Will update the S3 bucket where the graph is hosted and automatically update the graph on the website.
+        """
+        # gets the portfolio data from DynamoDB and stores it in a dataframe
+        def fetch_portfolio_data():
+            session = boto3.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region_name
+            )
+            dynamodb = session.resource('dynamodb')
+            table = dynamodb.Table('stock_data')
+            response = table.scan()
+            data = response['Items']
+            df = pd.DataFrame(data)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df['Price'] = pd.to_numeric(df['Price'])
+            df['Quantity'] = pd.to_numeric(df['Quantity'])
+            df['Profit'] = pd.to_numeric(df['Profit'])
+            df['Valuation'] = pd.to_numeric(df['Valuation'])
+
+            df = df.sort_values(by='Date').reset_index(drop=True)
+            return df
+
+
+
+        # Fetch historical stock data for valuation analysis using yfinance
+        def fetch_historical_data(symbols, start_date, end_date):
+            historical_data = yf.download(symbols, start=start_date, end=end_date, group_by='ticker', progress=False, threads=True)
+            return historical_data
+
+        # Calculate continuous ROI over time based on amount invested
+        # This includes both realized profit from sold stocks and unrealized gains from unsold stocks
+        def calculate_continuous_ROI(df):
+            # Separate BUY and SELL rows
+            buy_df = df[df['Type'] == 'BUY'].copy()
+            sell_df = df[df['Type'] == 'SELL'].copy()
+
+            # Calculate the cumulative amount invested at each row (BUY trade)
+            buy_df['Cumulative Invested'] = buy_df['Valuation'].cumsum()
+
+            # Create a date range from the earliest to the latest date
+            start_date = df['Date'].min()
+            end_date = df['Date'].max()
+            date_range = pd.date_range(start=start_date, end=end_date)
+
+            # Fetch historical data for all unique tickers in the portfolio
+            symbols = df['Ticker'].unique().tolist()
+            historical_data = fetch_historical_data(symbols, start_date, end_date)
+
+            # Initialize a DataFrame to store ROI for each day
+            roi_df = pd.DataFrame(date_range, columns=['Date'])
+
+            # Calculate the cumulative profit and unrealized valuation growth
+            cumulative_profit = 0
+            roi_list = []
+            for current_date in date_range:
+                # Update cumulative profit for SELL trades on the current date
+                daily_sell = sell_df[sell_df['Date'] == current_date]
+                if not daily_sell.empty:
+                    cumulative_profit += daily_sell['Profit'].sum()
+
+                # Update cumulative valuation for unsold stocks
+                unsold_stocks = buy_df[buy_df['Date'] <= current_date]
+                cumulative_valuation = 0
+                for ticker in unsold_stocks['Ticker'].unique():
+                    stock_data = unsold_stocks[unsold_stocks['Ticker'] == ticker]
+                    total_quantity = stock_data['Quantity'].sum()
+                    if total_quantity > 0:
+                        # Get the latest closing price up to the current date
+                        try:
+                            latest_price = historical_data[ticker]['Close'].loc[:current_date].iloc[-1]
+                            cumulative_valuation += total_quantity * latest_price
+                        except KeyError:
+                            # Handle cases where historical data is missing for the date
+                            pass
+                        except IndexError:
+                            # Handle cases where no data is available for the date
+                            pass
+
+                # Calculate total current value (realized profit + current valuation of unsold stocks)
+                total_value = cumulative_profit + cumulative_valuation
+
+                # Calculate ROI based on cumulative amount invested
+                cumulative_invested = buy_df[buy_df['Date'] <= current_date]['Valuation'].sum()
+                roi = ((total_value - cumulative_invested) / cumulative_invested) * 100 if cumulative_invested > 0 else 0
+
+                # Append the ROI value for the current date
+                roi_list.append(roi)
+
+            # Add the ROI values to the ROI DataFrame
+            roi_df['ROI'] = roi_list
+            return roi_df
+
+        # Fetch SPY historical data using yfinance for comparison
+        def fetch_spy_data(start_date, end_date):
+            spy_data = yf.download('SPY', start=start_date, end=end_date)
+            spy_data['Date'] = spy_data.index
+            spy_data['SPY % Change'] = spy_data['Close'].pct_change() * 100
+            spy_data = spy_data[['Date', 'SPY % Change']].reset_index(drop=True)
+            return spy_data
+
+
+        # Calculate portfolio metrics
+        def calculate_portfolio_metrics(roi_df, spy_data, trades_df):
+            # Merges the ROI and the SPY dataframes on matching dates
+            roi_df['Date'] = pd.to_datetime(roi_df['Date']).dt.date
+            spy_data.columns = spy_data.columns.droplevel(0)
+            spy_data.columns = ['Date', 'SPY % Change']
+            spy_data['Date'] = pd.to_datetime(spy_data['Date']).dt.date
+            roi_df.fillna(0, inplace=True)
+            spy_data.fillna(0, inplace=True)
+            roi_df = roi_df[roi_df['Date'].isin(spy_data['Date'])]
+            merged_data = pd.merge(roi_df, spy_data, on='Date', how='inner')
+
+            # Calculates the beta of the portfolio
+            covariance = np.cov(merged_data['ROI'], merged_data['SPY % Change'])[0][1]
+            variance = np.var(merged_data['SPY % Change'])
+            beta = covariance / variance
+            daily_returns = merged_data['ROI']
+
+            # Calculates the Sharpe Ratio
+            sharpe_ratio = daily_returns.mean() / daily_returns.std() if daily_returns.std() != 0 else 0
+            trades_df = trades_df[trades_df['Type'] == 'SELL']
+
+            # Calculates win rate
+            win_rate = (trades_df[trades_df['Profit'] > 0].shape[0] / trades_df.shape[0]) * 100 if trades_df.shape[0] > 0 else 0
+
+            return beta, sharpe_ratio, win_rate
+
+        # Plot ROI vs SPY % change using Plotly
+        def create_plotly_graph(continuous_roi_df, spy_data, metrics):
+            beta, sharpe_ratio, win_rate = metrics
+            fig = go.Figure()
+
+            # Add Portfolio ROI line
+            fig.add_trace(
+                go.Scatter(
+                    x=continuous_roi_df['Date'],
+                    y=continuous_roi_df['ROI'],
+                    mode='lines+markers',
+                    name='Portfolio ROI (%)',
+                    line=dict(color='blue')
+                )
+            )
+
+            # Add SPY Change line
+            fig.add_trace(
+                go.Scatter(
+                    x=spy_data['Date'],
+                    y=spy_data['SPY % Change'].cumsum(),
+                    mode='lines+markers',
+                    name='SPY Change (%)',
+                    line=dict(color='red')
+                )
+            )
+
+            # Update layout to improve the hover and display
+            fig.update_layout(
+                title={
+                    'text': "Portfolio ROI vs SPY Change Over Time",
+                    'y': 0.9,
+                    'x': 0.5,
+                    'xanchor': 'center',
+                    'yanchor': 'top'
+                },
+                xaxis_title="Date",
+                yaxis_title="Percentage (%)",
+                legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01),
+                margin=dict(l=40, r=40, t=80, b=150),
+                font=dict(size=12),
+                hovermode="x unified"
+            )
+
+            # Add metrics below the graph
+            metrics_text = f"""
+            <b>Portfolio Beta:</b> {beta:.2f}  |  
+            <b>Sharpe Ratio:</b> {sharpe_ratio:.2f}  |  
+            <b>Win Rate:</b> {win_rate:.2f}%
+            """
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=0.5, y=-0.25, showarrow=False,
+                text=metrics_text,
+                font=dict(size=14),
+                align="center"
+            )
+            return fig
+
+
+
+        # Upload to S3
+        def upload_to_s3(file_name, bucket_name, object_name=None):
+            session = boto3.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region_name
+            )
+            s3 = session.client('s3')
+
+            if object_name is None:
+                object_name = file_name
+
+            try:
+                s3.upload_file(file_name, bucket_name, object_name, ExtraArgs={'ContentType': 'text/html'})
+                print(f"File {file_name} uploaded successfully to {bucket_name}/{object_name}")
+            except Exception as e:
+                print(f"Error uploading to S3: {e}")
+
+        # Save and upload Plotly graph to S3
+        def save_and_upload_plotly_graph(fig, bucket_name, file_name="portfolio_graph.html", object_name=None):
+            fig.write_html(file_name)
+            print(f"Graph saved locally as {file_name}.")
+            # Upload the graph to S3
+            upload_to_s3(file_name, bucket_name, object_name)
+
+        bucket_name = "AWS S3 BUCKET NAME"
+
+        # Fetch portfolio and SPY data
+        df = fetch_portfolio_data()
+        spy_data = fetch_spy_data(df['Date'].min(), df['Date'].max())
+        trades_df = df.copy()
+
+        # Calculate ROI and metrics
+        roi_df = calculate_continuous_ROI(df)
+        metrics = calculate_portfolio_metrics(roi_df, spy_data, trades_df)
+
+        # Generate Plotly graph
+        fig = create_plotly_graph(roi_df, spy_data, metrics)
+
+        # Save and upload the graph to S3
+        save_and_upload_plotly_graph(fig, bucket_name, file_name="portfolio_graph.html")
+
+    generate_graph(aws_access_key, aws_secret_access_key, region_name)
 
 def lambda_handler(event, context):
     start_algorithm()
